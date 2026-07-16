@@ -1,0 +1,6 @@
+target/
+devlogs/
+.zed
+.cursor
+scratch/
+*.csv
