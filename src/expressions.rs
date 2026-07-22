@@ -1,5 +1,6 @@
 use crate::schema;
-use anyhow::Result;
+use anyhow::{bail, Result};
+use arrow::datatypes::DataType;
 use sqlparser::ast;
 use std::hash::{Hash, Hasher};
 
@@ -26,15 +27,67 @@ impl Expression {
     /// primary source of information of our Schema knowledge
     pub fn to_field(&self) -> Result<schema::Field> {
         match self {
-            Expression::Aggregate(a) => Ok(schema::Field {
-                name: a.operator.to_string(),
+            Expression::Aggregate(a) => {
+                // COUNT is always Int32; other aggregates inherit the inner expr type
+                let datatype = if matches!(a.operator, Operator::COUNT) {
+                    DataType::Int32
+                } else {
+                    a.expression.to_field()?.datatype
+                };
+                Ok(schema::Field {
+                    name: a.operator.to_string(),
+                    datatype,
+                })
+            }
+            Expression::Binary(b) => {
+                // Comparisons / boolean ops → Boolean; math ops keep the left operand's type
+                let datatype = match b.operator {
+                    BinaryOperator::Eq
+                    | BinaryOperator::Neq
+                    | BinaryOperator::Gt
+                    | BinaryOperator::GtEq
+                    | BinaryOperator::Lt
+                    | BinaryOperator::LtEq
+                    | BinaryOperator::And
+                    | BinaryOperator::Or => DataType::Boolean,
+                    BinaryOperator::Add
+                    | BinaryOperator::Subtract
+                    | BinaryOperator::Multiply
+                    | BinaryOperator::Divide
+                    | BinaryOperator::Modulus => b.L.to_field()?.datatype,
+                };
+                Ok(schema::Field {
+                    name: b.operator.to_string(),
+                    datatype,
+                })
+            }
+            Expression::Column(c) => {
+                // Book: look up `c.name` in the input plan's schema. Without that
+                // input parameter we cannot resolve the column's type.
+                bail!(
+                    "column '{}' requires an input schema to resolve its type",
+                    c.name
+                )
+            }
+            Expression::ColumnIndex(c) => {
+                // Book: return `input.schema().fields[c.index]`
+                bail!(
+                    "column index {} requires an input schema to resolve its type",
+                    c.index
+                )
+            }
+            Expression::Alias(a) => Ok(schema::Field {
+                name: a.alias.clone(),
                 datatype: a.expression.to_field()?.datatype,
             }),
-            Expression::Binary(b) => Ok(schema::Field {
-                name: b.operator.to_string(),
-                datatype: b.L.to_field()?.datatype,
+            Expression::LiteralString(s) => Ok(schema::Field {
+                name: s.value.clone(),
+                datatype: DataType::Utf8,
             }),
-            _ => unimplemented!(),
+            Expression::LiteralDouble(d) => Ok(schema::Field {
+                name: d.value.to_string(),
+                datatype: DataType::Float64,
+            }),
         }
     }
 }
@@ -111,7 +164,7 @@ impl BinaryOperator {
             ast::BinaryOperator::Multiply => BinaryOperator::Multiply,
             ast::BinaryOperator::Divide => BinaryOperator::Divide,
             ast::BinaryOperator::Modulo => BinaryOperator::Modulus,
-            _ => unimplemented!(),
+            _ => unimplemented!("unsupported binary operator received {}", binop),
         }
     }
 }
@@ -163,4 +216,19 @@ impl Hash for LiteralDouble {
 #[derive(Debug, PartialEq, Eq, Hash, Clone)]
 pub struct LiteralLong {
     pub value: i64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn column_to_field_needs_input_schema() {
+        // A Column is only a name — type lives on the input relation's schema.
+        // to_field(&self) has no input, so this must fail (same for ColumnIndex).
+        let expr = Expression::Column(Column {
+            name: "salary".to_string(),
+        });
+        assert!(expr.to_field().is_err());
+    }
 }

@@ -214,7 +214,7 @@ pub enum ScanSource {
 }
 
 pub struct Scan {
-    datasource: ScanSource,
+    pub datasource: ScanSource,
 }
 
 impl fmt::Display for LogicalPlanNode {
@@ -327,10 +327,9 @@ mod tests {
             })),
         }));
 
-        let mut filter_exps = Vec::new();
-        filter_exps.push(Expression::Column(Column {
+        let mut filter_exps = Expression::Column(Column {
             name: String::from("age"),
-        }));
+        });
 
         let dataframe = df.aggregate(agg_exps).filter(filter_exps);
     }

@@ -90,12 +90,12 @@ impl Planner {
                     expression,
                 }) = exp.1
                 {
-                    let idx = aggregates.element_offset(exp.1).unwrap();
+                    let idx = aggregates.iter().position(|x| x == exp.1).unwrap();
                     Expression::ColumnIndex(ColumnIndex {
                         index: ir.groupby.len() + idx,
                     })
                 } else {
-                    let idx = ir.groupby.element_offset(exp.1).unwrap();
+                    let idx = ir.groupby.iter().position(|x| x == exp.1).unwrap();
                     Expression::ColumnIndex(ColumnIndex { index: idx })
                 }
             })
@@ -193,7 +193,7 @@ impl Planner {
                                 ir.select.push(cex.unwrap());
                             }
                         }
-                        _ => unimplemented!(),
+                        _ => unimplemented!("unsupported SelectItem {}", si),
                     }
                 }
 
@@ -470,13 +470,20 @@ impl QueryIR {
 
 #[cfg(test)]
 mod tests {
+    use anyhow::Error;
+
     use super::*;
 
     // #[ignore = "changes made to code but yet to change this test"]
     #[test]
-    fn test_dataframe_from_sql() -> Result<(), Box<dyn std::error::Error>> {
+    fn test_dataframe_from_sql() -> Result<(), Error> {
+        use crate::dataframe::{LogicalPlanNode, Scan, ScanSource};
+        use crate::datasource::Csv;
+        use crate::schema::{Field, Schema};
+        use arrow::datatypes::DataType;
         use sqlparser::dialect::GenericDialect;
         use sqlparser::parser::Parser;
+
         let dialect = GenericDialect {};
 
         let sql = "SELECT
@@ -507,17 +514,41 @@ mod tests {
               salary * 1.1,
               (salary + 500) / 12;";
 
+        let schema = Schema {
+            fields: vec![
+                Field {
+                    name: "id".to_string(),
+                    datatype: DataType::Int64,
+                },
+                Field {
+                    name: "state".to_string(),
+                    datatype: DataType::Utf8,
+                },
+                Field {
+                    name: "first_name".to_string(),
+                    datatype: DataType::Utf8,
+                },
+                Field {
+                    name: "salary".to_string(),
+                    datatype: DataType::Float64,
+                },
+            ],
+        };
+
+        let path = String::from("employees.csv");
+        let projections = ["id", "state", "first_name", "salary"];
+        let scan = Scan {
+            datasource: ScanSource::Csv(Csv::new(&path, &projections, 3, Rc::new(schema))?),
+        };
+        let employee_df = DataFrame::with(LogicalPlanNode::ScanNode(Box::new(scan)));
+
         let ast = Parser::parse_sql(&dialect, sql).unwrap();
         let mut tables: HashMap<String, DataFrame> = HashMap::new();
-        let planner = Planner::new(tables);
+        tables.insert("employee".to_string(), employee_df);
+        let planner = Planner::new();
 
-        for elem in ast.iter() {
-            let res = planner.query_ir(elem).unwrap();
-            for item in res.select.iter() {
-                println!("expressison DEBUG: {:?}", item);
-            }
-        }
-
+        let fdf = planner.dataframe_from_sql(&ast.first().unwrap(), &tables)?;
+        println!("plan: {}", fdf.to_string());
         Ok(())
     }
 }
