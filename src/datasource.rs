@@ -55,6 +55,10 @@ impl Csv {
             col_indices,
         })
     }
+
+    pub(crate) fn schema(&self) -> &Schema {
+        &self.schema
+    }
 }
 
 impl Iterator for Csv {

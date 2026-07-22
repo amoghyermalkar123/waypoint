@@ -116,21 +116,29 @@ impl LogicalPlanNode {
     fn schema(&self) -> Result<Schema> {
         match self {
             LogicalPlanNode::AggregateNode(n) => {
+                let input_schema = n.input.schema()?;
                 let mut fields = Vec::new();
                 for ex in n.exprs.iter() {
-                    let af = ex.to_field()?;
+                    let af = ex.to_field(&input_schema)?;
                     fields.push(af);
                 }
                 Ok(Schema { fields })
             }
             LogicalPlanNode::ProjectNode(n) => {
+                let input_schema = n.input.schema()?;
                 let mut fields = Vec::new();
                 for ex in n.exprs.iter() {
-                    let af = ex.to_field()?;
+                    let af = ex.to_field(&input_schema)?;
                     fields.push(af);
                 }
                 Ok(Schema { fields })
             }
+            LogicalPlanNode::FilterNode(n) => n.input.schema(),
+            LogicalPlanNode::ScanNode(n) => match &n.datasource {
+                ScanSource::Csv(csv) => Ok(Schema {
+                    fields: csv.schema().fields.clone(),
+                }),
+            },
             LogicalPlanNode::JoinNode(n) => {
                 let mut fields = Vec::new();
                 let mut left = n.left.schema()?.fields;
@@ -153,7 +161,6 @@ impl LogicalPlanNode {
                     _ => unimplemented!(),
                 }
             }
-            _ => return self.schema(),
         }
     }
 

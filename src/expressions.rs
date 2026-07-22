@@ -1,5 +1,5 @@
 use crate::schema;
-use anyhow::{bail, Result};
+use anyhow::Result;
 use arrow::datatypes::DataType;
 use sqlparser::ast;
 use std::hash::{Hash, Hasher};
@@ -24,15 +24,18 @@ impl Expression {
     /// to_field converts any given expression to a `Field` type.
     /// the main reason to do this is for it's further usage in Schema
     /// and logical plan computations. The Fields are going to be the
-    /// primary source of information of our Schema knowledge
-    pub fn to_field(&self) -> Result<schema::Field> {
+    /// primary source of information of our Schema knowledge.
+    ///
+    /// `input` is the schema of the child relation — Column / ColumnIndex
+    /// resolve name and type by looking themselves up there.
+    pub fn to_field(&self, input: &schema::Schema) -> Result<schema::Field> {
         match self {
             Expression::Aggregate(a) => {
                 // COUNT is always Int32; other aggregates inherit the inner expr type
                 let datatype = if matches!(a.operator, Operator::COUNT) {
                     DataType::Int32
                 } else {
-                    a.expression.to_field()?.datatype
+                    a.expression.to_field(input)?.datatype
                 };
                 Ok(schema::Field {
                     name: a.operator.to_string(),
@@ -54,7 +57,7 @@ impl Expression {
                     | BinaryOperator::Subtract
                     | BinaryOperator::Multiply
                     | BinaryOperator::Divide
-                    | BinaryOperator::Modulus => b.L.to_field()?.datatype,
+                    | BinaryOperator::Modulus => b.L.to_field(input)?.datatype,
                 };
                 Ok(schema::Field {
                     name: b.operator.to_string(),
@@ -62,23 +65,31 @@ impl Expression {
                 })
             }
             Expression::Column(c) => {
-                // Book: look up `c.name` in the input plan's schema. Without that
-                // input parameter we cannot resolve the column's type.
-                bail!(
-                    "column '{}' requires an input schema to resolve its type",
-                    c.name
-                )
+                input
+                    .fields
+                    .iter()
+                    .find(|f| f.name == c.name)
+                    .cloned()
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "No column named '{}' in {:?}",
+                            c.name,
+                            input.fields.iter().map(|f| &f.name).collect::<Vec<_>>()
+                        )
+                    })
             }
             Expression::ColumnIndex(c) => {
-                // Book: return `input.schema().fields[c.index]`
-                bail!(
-                    "column index {} requires an input schema to resolve its type",
-                    c.index
-                )
+                input.fields.get(c.index).cloned().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "column index {} out of range (0..{})",
+                        c.index,
+                        input.fields.len().saturating_sub(1)
+                    )
+                })
             }
             Expression::Alias(a) => Ok(schema::Field {
                 name: a.alias.clone(),
-                datatype: a.expression.to_field()?.datatype,
+                datatype: a.expression.to_field(input)?.datatype,
             }),
             Expression::LiteralString(s) => Ok(schema::Field {
                 name: s.value.clone(),
@@ -221,14 +232,21 @@ pub struct LiteralLong {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow::datatypes::DataType;
 
     #[test]
-    fn column_to_field_needs_input_schema() {
-        // A Column is only a name — type lives on the input relation's schema.
-        // to_field(&self) has no input, so this must fail (same for ColumnIndex).
+    fn column_to_field_resolves_from_input_schema() {
+        let input = schema::Schema {
+            fields: vec![schema::Field {
+                name: "salary".to_string(),
+                datatype: DataType::Float64,
+            }],
+        };
         let expr = Expression::Column(Column {
             name: "salary".to_string(),
         });
-        assert!(expr.to_field().is_err());
+        let field = expr.to_field(&input).expect("to_field");
+        assert_eq!("salary", field.name);
+        assert_eq!(DataType::Float64, field.datatype);
     }
 }
