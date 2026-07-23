@@ -251,60 +251,11 @@ impl Planner {
         match &ar.class {
             QueryClass::Relational => {
                 let df = table_catalog.get(&table_name).and_then(|leaf_df| {
-                    // the whole query building logic is built upon the primitive
-                    // leaf dataframe which is created during datasource creation time
-                    // only the leaf df has access to the underlying datasource the
-                    // rest of the logical plan compute nodes are built on top of this
-                    // and only contain child compute node metadata information
                     let mut final_df = leaf_df.clone();
-
-                    // apply projection i.e. select expressions
-                    // if we have interim projections we choose to apply those
-                    // as they are a superset consisting of select + interim
-                    // projected expressions
-                    if let Some(interim) = ar.interim_projections {
-                        final_df = final_df.project(interim);
+                    if let Some(w) = ar.wherec {
+                        final_df = final_df.filter(w);
                     }
-
-                    // apply selection/ filter i.e. where expressions
-                    if let Some(filter_expr) = ar.wherec {
-                        final_df = final_df.filter(filter_expr);
-                    }
-
-                    // post a where clause, we add a check incase our projection
-                    // list was widened by interim projections, we need to bring it
-                    // back down to the actual select list
-                    // this is because by now, the main select list columns are
-                    // computed, so we need to keep the first N expressions from the
-                    // original select clause
-                    let l = ar.select.len();
-                    let Some(fes) = final_df.schema().ok() else {
-                        return None;
-                    };
-
-                    // the length of the select clause expressions list matches that
-                    // of the expression list length produced by the schema of the final
-                    // dataframe, so we dont need to de-flatten anything, simply return the
-                    // this final produced dataframe
-                    if ar.select.len() == fes.fields.len() {
-                        return Some(final_df);
-                    }
-
-                    let mut deflattened_select_exprs = Vec::with_capacity(l);
-
-                    // assertion/ invariant: the fields produced by a dataframe will either be equal to the select
-                    // clause list or greater, so the for_each is infallible
-                    ar.select.iter().enumerate().for_each(|expr| {
-                        // acccording to above mentioned invariant this unwrap should always be safe
-                        let corr_name = fes.fields.iter().nth(expr.0).unwrap();
-                        let column_expr = Expression::Column(Column {
-                            name: String::from(corr_name.name.clone()),
-                        });
-                        deflattened_select_exprs.push(column_expr);
-                    });
-
-                    final_df = final_df.project(deflattened_select_exprs);
-
+                    final_df = final_df.project(ar.select);
                     Some(final_df)
                 });
 
@@ -675,6 +626,63 @@ Projection: #0, #1, #2, #3, #4, #5, #6, #7, #8, #9, #10
                 .contains("select expression must be present in groupby"),
             "unexpected error: {err}"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn relational_select_where_plan() -> Result<()> {
+        use crate::dataframe::{LogicalPlanNode, Scan, ScanSource};
+        use crate::datasource::Csv;
+        use crate::schema::{Field, Schema};
+        use arrow::datatypes::DataType;
+        use sqlparser::dialect::GenericDialect;
+        use sqlparser::parser::Parser;
+
+        let schema = Schema {
+            fields: vec![
+                Field {
+                    name: "id".to_string(),
+                    datatype: DataType::Int64,
+                },
+                Field {
+                    name: "state".to_string(),
+                    datatype: DataType::Utf8,
+                },
+                Field {
+                    name: "first_name".to_string(),
+                    datatype: DataType::Utf8,
+                },
+                Field {
+                    name: "salary".to_string(),
+                    datatype: DataType::Float64,
+                },
+            ],
+        };
+        let path = String::from("employees.csv");
+        let scan = Scan {
+            datasource: ScanSource::Csv(Csv::new(
+                &path,
+                &["id", "state", "first_name", "salary"],
+                3,
+                Rc::new(schema),
+            )?),
+        };
+        let mut tables = HashMap::new();
+        tables.insert(
+            "employee".to_string(),
+            DataFrame::with(LogicalPlanNode::ScanNode(Box::new(scan))),
+        );
+
+        let sql = "SELECT state, salary FROM employee WHERE salary > 0";
+        let ast = Parser::parse_sql(&GenericDialect {}, sql)?;
+        let df = Planner::new().dataframe_from_sql(&ast[0], &tables)?;
+
+        let expected = "\
+Projection: #state, #salary
+\tSelection: #salary > 0
+\t\tScan: employees.csv; projection=None
+";
+        assert_eq!(expected, df.to_string());
         Ok(())
     }
 }
