@@ -101,6 +101,22 @@ impl Expression {
             }),
         }
     }
+
+    /// Collect Column leaf expressions referenced by this expression tree.
+    pub fn collect_columns(&self, out: &mut Vec<Expression>) {
+        match self {
+            Expression::Column(_) => out.push(self.clone()),
+            Expression::Aggregate(a) => a.expression.collect_columns(out),
+            Expression::Binary(b) => {
+                b.L.collect_columns(out);
+                b.R.collect_columns(out);
+            }
+            Expression::Alias(a) => a.expression.collect_columns(out),
+            Expression::ColumnIndex(_)
+            | Expression::LiteralString(_)
+            | Expression::LiteralDouble(_) => {}
+        }
+    }
 }
 
 /// Aggregate expressions represent symbols such as SUM/MIN/MAX(column_name)

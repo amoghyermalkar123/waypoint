@@ -88,10 +88,15 @@ impl DataFrame {
         }
     }
 
-    pub fn aggregate(self, expressions: Vec<Expression>) -> DataFrame {
+    pub fn aggregate(
+        self,
+        group_expr: Vec<Expression>,
+        expressions: Vec<Expression>,
+    ) -> DataFrame {
         DataFrame {
             plan: Rc::new(LogicalPlanNode::AggregateNode(Box::new(Aggregation {
                 input: self.plan.clone(),
+                group_expr,
                 exprs: expressions,
             }))),
         }
@@ -118,9 +123,11 @@ impl LogicalPlanNode {
             LogicalPlanNode::AggregateNode(n) => {
                 let input_schema = n.input.schema()?;
                 let mut fields = Vec::new();
+                for ex in n.group_expr.iter() {
+                    fields.push(ex.to_field(&input_schema)?);
+                }
                 for ex in n.exprs.iter() {
-                    let af = ex.to_field(&input_schema)?;
-                    fields.push(af);
+                    fields.push(ex.to_field(&input_schema)?);
                 }
                 Ok(Schema { fields })
             }
@@ -183,8 +190,8 @@ pub enum LogicalPlanNode {
 }
 
 pub struct Projection {
-    input: Rc<LogicalPlanNode>,
-    exprs: Vec<Expression>,
+    pub(crate) input: Rc<LogicalPlanNode>,
+    pub(crate) exprs: Vec<Expression>,
 }
 
 pub struct Filter {
@@ -194,7 +201,8 @@ pub struct Filter {
 
 pub struct Aggregation {
     input: Rc<LogicalPlanNode>,
-    exprs: Vec<Expression>,
+    pub(crate) group_expr: Vec<Expression>,
+    pub(crate) exprs: Vec<Expression>,
 }
 
 pub enum JoinType {
@@ -235,11 +243,14 @@ impl fmt::Display for LogicalPlanNode {
                 write!(f, "Selection: {}", filter.exprs)
             }
             LogicalPlanNode::AggregateNode(a) => {
-                // gquery splits groupExpr / aggregateExpr; until you do too, print what you have:
-                let exprs: Vec<String> = a.exprs.iter().map(|e| e.to_string()).collect();
-                write!(f, "Aggregate: aggregateExpr=[{}]", exprs.join(", "))
-                // later:
-                // write!(f, "Aggregate: groupExpr=[{}], aggregateExpr=[{}]", ...)
+                let group: Vec<String> = a.group_expr.iter().map(|e| e.to_string()).collect();
+                let aggs: Vec<String> = a.exprs.iter().map(|e| e.to_string()).collect();
+                write!(
+                    f,
+                    "Aggregate: groupExpr=[{}], aggregateExpr=[{}]",
+                    group.join(", "),
+                    aggs.join(", ")
+                )
             }
             LogicalPlanNode::JoinNode(j) => {
                 write!(f, "Join: type={}, on={:?}", j.join_type, j.on)
@@ -338,7 +349,7 @@ mod tests {
             name: String::from("age"),
         });
 
-        let dataframe = df.aggregate(agg_exps).filter(filter_exps);
+        let dataframe = df.aggregate(Vec::new(), agg_exps).filter(filter_exps);
     }
 
     #[test]

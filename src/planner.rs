@@ -80,6 +80,39 @@ impl Planner {
             })
             .collect();
 
+        if aggregates.len() == 0 {
+            if ir.groupby.len() > 0 {
+                bail!("GROUP BY without aggregate expressions is not supported")
+            }
+
+            return Ok(AnalyzedQuery {
+                class: QueryClass::Relational,
+                select: ir.select,
+                wherec: ir.wherec,
+                groupby: ir.groupby,
+                having: ir.having,
+                interim_projections: None,
+                aggregates,
+                outputReferences: None,
+            });
+        }
+
+        // validate that the select expressions are present in the group by clause as well
+        // because this is an aggregate query (must run before building output refs)
+        for item in ir.select.iter() {
+            match item {
+                Expression::Aggregate(Aggregate {
+                    operator,
+                    expression,
+                }) => {}
+                _ => {
+                    if !ir.groupby.contains(item) {
+                        bail!("select expression must be present in groupby")
+                    }
+                }
+            }
+        }
+
         let output_refs: Vec<Expression> = ir
             .select
             .iter()
@@ -101,49 +134,16 @@ impl Planner {
             })
             .collect();
 
-        if aggregates.len() == 0 {
-            if ir.groupby.len() > 0 {
-                bail!("GROUP BY without aggregate expressions is not supported")
-            }
-
-            return Ok(AnalyzedQuery {
-                class: QueryClass::Relational,
-                select: ir.select,
-                wherec: ir.wherec,
-                groupby: ir.groupby,
-                having: ir.having,
-                interim_projections: None,
-                aggregates,
-                outputReferences: None,
-            });
-        } else {
-            // validate that the select expressions are present in the group by clause as well
-            // because this is an aggregate query
-            for item in ir.select.iter() {
-                match item {
-                    Expression::Aggregate(Aggregate {
-                        operator,
-                        expression,
-                    }) => {}
-                    _ => {
-                        if !ir.groupby.contains(item) {
-                            bail!("select expression must be present in groupby")
-                        }
-                    }
-                }
-            }
-
-            Ok(AnalyzedQuery {
-                class: QueryClass::Aggregate,
-                select: ir.select,
-                wherec: ir.wherec,
-                groupby: ir.groupby,
-                having: ir.having,
-                interim_projections: None,
-                aggregates,
-                outputReferences: Some(output_refs),
-            })
-        }
+        Ok(AnalyzedQuery {
+            class: QueryClass::Aggregate,
+            select: ir.select,
+            wherec: ir.wherec,
+            groupby: ir.groupby,
+            having: ir.having,
+            interim_projections: None,
+            aggregates,
+            outputReferences: Some(output_refs),
+        })
     }
 
     /// parses the AST's from clause and returns the table name as
@@ -317,28 +317,44 @@ impl Planner {
             QueryClass::Aggregate => {
                 let df = table_catalog.get(&table_name).and_then(|leaf_df| {
                     let mut final_df = leaf_df.clone();
-                    let mut hs = HashSet::new();
-                    ar.select.iter().for_each(|e| {
-                        let _ = hs.insert(e);
-                    });
-                    ar.aggregates.iter().for_each(|e| {
-                        let _ = hs.insert(e);
-                    });
-                    ar.groupby.iter().for_each(|e| {
-                        let _ = hs.insert(e);
-                    });
-
+                    let mut seen = HashSet::new();
                     let mut interim = Vec::new();
-                    ar.groupby.iter().for_each(|exp| {
-                        if !hs.contains(exp) {
+
+                    // group keys first (order aligns with Aggregate output schema)
+                    for exp in ar.groupby.iter() {
+                        if seen.insert(exp.clone()) {
                             interim.push(exp.clone());
                         }
-                    });
+                    }
 
+                    // columns nested inside aggregates (e.g. salary from SUM(salary))
+                    for agg in ar.aggregates.iter() {
+                        let mut cols = Vec::new();
+                        agg.collect_columns(&mut cols);
+                        for col in cols {
+                            if seen.insert(col.clone()) {
+                                interim.push(col);
+                            }
+                        }
+                    }
+
+                    // columns from WHERE (Filter runs after this Project)
+                    if let Some(ref wherec) = ar.wherec {
+                        let mut cols = Vec::new();
+                        wherec.collect_columns(&mut cols);
+                        for col in cols {
+                            if seen.insert(col.clone()) {
+                                interim.push(col);
+                            }
+                        }
+                    }
+
+                    final_df = final_df.project(interim);
+                    if let Some(w) = ar.wherec {
+                        final_df = final_df.filter(w);
+                    }
                     final_df = final_df
-                        .project(interim)
-                        .filter(ar.wherec.unwrap())
-                        .aggregate(ar.aggregates)
+                        .aggregate(ar.groupby, ar.aggregates)
                         .project(ar.outputReferences.unwrap());
 
                     Some(final_df)
@@ -548,7 +564,17 @@ mod tests {
         let planner = Planner::new();
 
         let fdf = planner.dataframe_from_sql(&ast.first().unwrap(), &tables)?;
-        println!("plan: {}", fdf.to_string());
+
+        // Project(outputRefs) → Aggregate(group, aggs) → Filter(where) → Project(interim) → Scan
+        let expected = "\
+Projection: #0, #1, #2, #3, #4, #5, #6, #7, #8, #9, #10
+\tAggregate: groupExpr=[#state, #first_name, #salary - 100, #salary * 1.1, #salary + 500 / 12], aggregateExpr=[SUM(#salary), MIN(#salary), MAX(#salary), AVG(#salary), COUNT(#*), COUNT(#first_name)]
+\t\tSelection: #state = 'CO' OR #state != 'TX' AND #salary > 1000 AND #salary >= 500 AND #salary < 200000 AND #salary <= 150000 AND #id % 2 = 0
+\t\t\tProjection: #state, #first_name, #salary - 100, #salary * 1.1, #salary + 500 / 12, #salary, #*, #id
+\t\t\t\tScan: employees.csv; projection=None
+";
+        assert_eq!(expected, fdf.to_string());
+
         Ok(())
     }
 
@@ -578,12 +604,7 @@ mod tests {
         };
         let path = String::from("employees.csv");
         let scan = Scan {
-            datasource: ScanSource::Csv(Csv::new(
-                &path,
-                &["state", "salary"],
-                3,
-                Rc::new(schema),
-            )?),
+            datasource: ScanSource::Csv(Csv::new(&path, &["state", "salary"], 3, Rc::new(schema))?),
         };
         let mut tables = HashMap::new();
         tables.insert(
@@ -599,6 +620,61 @@ mod tests {
         assert_eq!(2, out.fields.len());
         assert_eq!("state", out.fields[0].name);
         assert_eq!("SUM", out.fields[1].name);
+        Ok(())
+    }
+
+    #[test]
+    fn aggregate_select_expr_must_be_in_groupby() -> Result<()> {
+        use crate::dataframe::{LogicalPlanNode, Scan, ScanSource};
+        use crate::datasource::Csv;
+        use crate::schema::{Field, Schema};
+        use arrow::datatypes::DataType;
+        use sqlparser::dialect::GenericDialect;
+        use sqlparser::parser::Parser;
+
+        let schema = Schema {
+            fields: vec![
+                Field {
+                    name: "state".to_string(),
+                    datatype: DataType::Utf8,
+                },
+                Field {
+                    name: "first_name".to_string(),
+                    datatype: DataType::Utf8,
+                },
+                Field {
+                    name: "salary".to_string(),
+                    datatype: DataType::Float64,
+                },
+            ],
+        };
+        let path = String::from("employees.csv");
+        let scan = Scan {
+            datasource: ScanSource::Csv(Csv::new(
+                &path,
+                &["state", "first_name", "salary"],
+                3,
+                Rc::new(schema),
+            )?),
+        };
+        let mut tables = HashMap::new();
+        tables.insert(
+            "employee".to_string(),
+            DataFrame::with(LogicalPlanNode::ScanNode(Box::new(scan))),
+        );
+
+        // first_name is in SELECT but not GROUP BY
+        let sql = "SELECT state, first_name, SUM(salary) FROM employee GROUP BY state";
+        let ast = Parser::parse_sql(&GenericDialect {}, sql)?;
+        let err = Planner::new()
+            .dataframe_from_sql(&ast[0], &tables)
+            .err()
+            .expect("non-groupby SELECT expr must be rejected");
+        assert!(
+            err.to_string()
+                .contains("select expression must be present in groupby"),
+            "unexpected error: {err}"
+        );
         Ok(())
     }
 }
