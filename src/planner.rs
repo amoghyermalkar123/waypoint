@@ -551,4 +551,54 @@ mod tests {
         println!("plan: {}", fdf.to_string());
         Ok(())
     }
+
+    /// Aggregate output schema must be [group keys..., aggs...].
+    /// Today Aggregation only stores aggs, so schema() is wrong / fails.
+    #[test]
+    fn aggregate_schema_is_groupby_then_aggs() -> Result<()> {
+        use crate::dataframe::{LogicalPlanNode, Scan, ScanSource};
+        use crate::datasource::Csv;
+        use crate::schema::{Field, Schema};
+        use arrow::datatypes::DataType;
+        use sqlparser::dialect::GenericDialect;
+        use sqlparser::parser::Parser;
+        use std::rc::Rc;
+
+        let schema = Schema {
+            fields: vec![
+                Field {
+                    name: "state".to_string(),
+                    datatype: DataType::Utf8,
+                },
+                Field {
+                    name: "salary".to_string(),
+                    datatype: DataType::Float64,
+                },
+            ],
+        };
+        let path = String::from("employees.csv");
+        let scan = Scan {
+            datasource: ScanSource::Csv(Csv::new(
+                &path,
+                &["state", "salary"],
+                3,
+                Rc::new(schema),
+            )?),
+        };
+        let mut tables = HashMap::new();
+        tables.insert(
+            "employee".to_string(),
+            DataFrame::with(LogicalPlanNode::ScanNode(Box::new(scan))),
+        );
+
+        let sql = "SELECT state, SUM(salary) FROM employee WHERE salary > 0 GROUP BY state";
+        let ast = Parser::parse_sql(&GenericDialect {}, sql)?;
+        let df = Planner::new().dataframe_from_sql(&ast[0], &tables)?;
+
+        let out = df.schema()?;
+        assert_eq!(2, out.fields.len());
+        assert_eq!("state", out.fields[0].name);
+        assert_eq!("SUM", out.fields[1].name);
+        Ok(())
+    }
 }
